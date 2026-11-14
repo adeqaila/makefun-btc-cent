@@ -1,99 +1,144 @@
-// btc-cent-forecast-01: forecast Bitcoin's price 240 minutes after the checkpoint.
+// btc-cent-forecast-01 — guess Bitcoin's price 240 minutes past the checkpoint.
 //
-// Method: the checkpoint close, pulled 25% of the way toward the median of the
-// last 30 closes. That is, forecast = last + 0.25 * (median30 - last).
+// The entry is scored by mean absolute error in cents, so the right target
+// is the conditional median of the price four hours out, not the mean and
+// not a point guess dressed up as one. The checkpoint close itself is the
+// obvious starting point, but it is one single 1-minute bar from one Orca
+// pool: a chunky trade can shove that pool's print away from where the
+// market actually sits, if only for a minute. A median over the last half
+// hour of closes is far less moved by one odd bar, so it works as a steady
+// anchor for "where the price is". The forecast therefore starts at the
+// checkpoint close and slides a quarter of the distance toward that anchor:
 //
-// Why: under mean absolute error the honest target is the conditional median.
-// The checkpoint close is a single 1-minute bar from one Orca pool, and a
-// large trade can move that pool's price for a moment, so the last close
-// carries a little noise. The median of the last 30 closes is a robust
-// estimate of the level the price is sitting at; pulling the forecast a
-// quarter of the way toward it de-noises the checkpoint close without ever
-// moving the forecast far from the last price. In a trending market the
-// median lags, so the pull is kept small (25%) on purpose.
+//     forecast = last + 0.25 * (median of last 30 closes - last)
 //
-// Evidence (see PROGRESS.md): no candidate beats persistence on every
-// validation. On the official 5 practice cases with known actuals this
-// scores 48,604 cents vs persistence 47,055 (+3.3%); on 16 non-overlapping
-// rolling checkpoints cut from the same recording it scores 40,177 vs
-// 41,768 (-3.8%); on 64 overlapping checkpoints 42,402 vs 42,871 (-1.1%).
-// Trend/drift models win the practice by more but lose on the rolling
-// checkpoints — overfitting the practice window's downtrend — so they were
-// rejected. This is the minimax-regret pick: it never strays far from
-// persistence, and it is the only deviation that is better than persistence
-// on the broad rolling validation while staying within ~3% of it on the
-// official practice.
+// The slide is deliberately small. When the market is trending the
+// 30-close median trails behind the live price, and a big pull would drag
+// the forecast backwards; a quarter is enough to shave off the checkpoint
+// noise without ever pulling the guess far from the last print.
 //
-// The program reads every <id>.in in the input directory (the grader runs
-// one case at a time, with only that case's file there) and writes
-// <id>.out: {"forecasts":[{"case":"<id>","price":<number>}]}, exactly one
-// row naming the case and no other key. Deterministic, no network, no
-// randomness, standard library only.
+// What the numbers said (full comparison in PROGRESS.md): on the 5
+// official practice cases with recoverable actuals this scores 48,604
+// cents against persistence's 47,055 — a touch worse on that one window.
+// On 16 non-overlapping rolling checkpoints cut from the same recording
+// it scores 40,177 against 41,768 (-3.8%), and on 64 overlapping ones
+// 42,402 against 42,871 (-1.1%). Trend and drift variants win the
+// practice window by more and then lose on the rolling checkpoints, which
+// is the signature of fitting the practice window's downtrend, so they
+// were thrown out. This is the minimax-regret choice: it never wanders
+// far from persistence, and it is the only deviation that beats
+// persistence on the broad rolling validation while staying within about
+// 3% of it on the official practice.
 //
-// Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR
-// stand in for /input and /output:
+// I/O contract: the grader drops one <id>.in per case into the input
+// directory and expects <id>.out holding exactly
+// {"forecasts":[{"case":"<id>","price":<number>}]}, one row, no extra
+// keys. Prices are kept on the 5-decimal grid and inside (0, 10000000).
+// Deterministic, no network, no randomness, Node 22 standard library only.
+//
+// Local check:
 //   mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-/** The smallest positive price on the grid: one unit of its 5 decimals. */
-const MIN_PRICE = 0.00001;
-/** The largest grid price below the scorer's exclusive 10,000,000-dollar cap. */
-const MAX_PRICE = 9_999_999.99999;
+// One unit of the scorer's 5-decimal price grid: also the smallest
+// positive price we are allowed to emit.
+const GRID = 0.00001;
+// Largest grid price still strictly below the scorer's 10,000,000 cap.
+const PRICE_CAP = 10_000_000 - GRID;
+// Fraction of the gap between last close and median anchor we close.
+const PULL_FRACTION = 0.25;
+// How many recent closes feed the median anchor, in minutes.
+const LOOKBACK_MINUTES = 30;
 
-/** How far the forecast is pulled from the last close toward the median. */
-const PULL = 0.25;
-/** The window the median is taken over, in minutes. */
-const MEDIAN_WINDOW = 30;
-
-interface CaseMarket {
+type Market = {
   id: string;
   prices: number[];
+};
+
+type CaseFile = {
+  markets: Market[];
+};
+
+/**
+ * Snap a raw price onto the 5-decimal grid and inside the scorer's
+ * allowed interval (0, 10,000,000). Clamp first, then round, so the
+ * rounded value can never slip outside the interval.
+ */
+function quantise(price: number): number {
+  const bounded = Math.min(PRICE_CAP, Math.max(GRID, price));
+  return Math.round(bounded * 1e5) / 1e5;
 }
 
-interface Case {
-  markets: CaseMarket[];
-}
-
-/** x kept on the grid's 5 decimals and inside the scorer's (0, 10,000,000). */
-const price5 = (x: number): number => Math.round(Math.min(MAX_PRICE, Math.max(MIN_PRICE, x)) * 1e5) / 1e5;
-
-/** The median of a non-empty list of numbers. */
-function median(xs: number[]): number {
-  const s = [...xs].sort((a, b) => a - b);
-  const n = s.length;
-  const mid = Math.floor(n / 2);
-  return n % 2 === 1 ? (s[mid] as number) : (((s[mid - 1] as number) + (s[mid] as number)) / 2);
+/** Middle value of a non-empty list; for an even count, the mean of the two middle values. */
+function middleValue(values: number[]): number {
+  const ordered = values.slice().sort((a, b) => a - b);
+  const half = ordered.length >> 1;
+  if (ordered.length % 2 === 0) {
+    return (ordered[half - 1]! + ordered[half]!) / 2;
+  }
+  return ordered[half]!;
 }
 
 /**
- * The forecast for one market: the last close, pulled PULL of the way
- * toward the median of the last MEDIAN_WINDOW closes (or all closes when
- * the series is shorter than the window).
+ * The anchor for one market: the median of its most recent closes.
+ * Only finite, positive closes count — grid prices are positive by
+ * construction, so a corrupt non-positive bar must not drag the anchor
+ * around. Returns undefined when no usable close exists.
  */
-function forecast(m: CaseMarket): number {
-  if (!Array.isArray(m.prices) || m.prices.length === 0) throw new Error(`market ${m.id} has no prices`);
-  const last = m.prices[m.prices.length - 1] as number;
-  if (typeof last !== 'number' || !Number.isFinite(last)) throw new Error(`market ${m.id}'s last price is not a finite number`);
-  // Only finite, positive closes enter the median: grid prices are
-  // positive, so a corrupt non-positive bar must not poison the median
-  // (the last close itself is already checked above).
-  const window = m.prices.slice(-MEDIAN_WINDOW).filter((x) => typeof x === 'number' && Number.isFinite(x) && x > 0);
-  if (window.length === 0) return price5(last);
-  const med = median(window);
-  return price5(last + PULL * (med - last));
+function recentAnchor(market: Market): number | undefined {
+  const tail = market.prices.slice(-LOOKBACK_MINUTES);
+  const usable = tail.filter((p) => Number.isFinite(p) && p > 0);
+  if (usable.length === 0) return undefined;
+  return middleValue(usable);
 }
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-// Every case file, in name order, so two runs write the same bytes.
-const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
-for (const file of inputs) {
-  const id = file.slice(0, -'.in'.length);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  if (!Array.isArray(c.markets) || c.markets.length !== 1) throw new Error(`${file} does not hold exactly one market`);
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts: [{ case: id, price: forecast(c.markets[0] as CaseMarket) }] })}\n`);
+/**
+ * One market's forecast: the checkpoint close, pulled a quarter of the
+ * way toward its median anchor. With no usable anchor the checkpoint
+ * close itself, quantised, is the forecast.
+ */
+function projectPrice(market: Market): number {
+  const closes = market.prices;
+  if (!Array.isArray(closes) || closes.length === 0) {
+    throw new Error(`market ${market.id} has no closes`);
+  }
+  const checkpoint = closes[closes.length - 1]!;
+  if (!Number.isFinite(checkpoint)) {
+    throw new Error(`market ${market.id}: checkpoint close is not a finite number`);
+  }
+  const anchor = recentAnchor(market);
+  if (anchor === undefined) return quantise(checkpoint);
+  return quantise(checkpoint + PULL_FRACTION * (anchor - checkpoint));
 }
+
+/** Render one case's answer file: exactly one forecast row, no extra keys. */
+function renderAnswer(id: string, price: number): string {
+  return `${JSON.stringify({ forecasts: [{ case: id, price }] })}\n`;
+}
+
+/** Read one case file, forecast its single market, write the one-row answer. */
+function handleCase(file: string): void {
+  const id = file.slice(0, -'.in'.length);
+  const parsed = JSON.parse(readFileSync(join(inputDir, file), 'utf8')) as CaseFile;
+  if (!Array.isArray(parsed.markets) || parsed.markets.length !== 1) {
+    throw new Error(`${file} does not hold exactly one market`);
+  }
+  const price = projectPrice(parsed.markets[0]!);
+  writeFileSync(join(outputDir, `${id}.out`), renderAnswer(id, price));
+}
+
+/** Forecast every case file in the input directory, in name order so two runs write identical bytes. */
+function run(): void {
+  mkdirSync(outputDir, { recursive: true });
+  const files = readdirSync(inputDir)
+    .filter((f) => f.endsWith('.in'))
+    .sort();
+  for (const file of files) handleCase(file);
+}
+
+run();
